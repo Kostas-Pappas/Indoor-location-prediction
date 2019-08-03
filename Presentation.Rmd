@@ -1,0 +1,398 @@
+---
+title: " Predicting location based on WIFI fingerprinting "
+author: "K.Pappas"
+output: 
+  rmdformats::readthedown :
+  collapsed: false
+  smooth_scroll: true
+  df_print: kable
+  gallery: true
+---
+  <style>
+  body {
+    text-align: justify}
+</style>
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.align = "center",
+	cache = TRUE
+)
+```
+
+
+```{r libraries, include=FALSE}
+library(caret)            # R modeling workhorse , ggplot2
+library(tidyverse)        # Package for tidying data
+library(lubridate)        # For working with dates/times of a time series
+library(VIM)              # Visualizing and imputing missing values
+library(Hmisc)            # for descriptive statistics
+library(forecast)         # forcasting package
+library(broom)            # Tidy statistical summary output
+library(knitr)            # report generation
+library(plotly)           # visualization
+library(imputeTS)         # imputing
+library(ggplot2)          # visualization
+library(GGally)           # visualization
+library(ggfortify)        
+library(naniar)           # handling missing values
+library(dplyr)            # data manipulation
+library(simputation)      # imputing
+library(ggcorrplot)       # PLOTTING CORELATIONS
+library(FactoMineR)       # Dimensions reduction
+library(factoextra)       # visualization for pca
+library(rgl)
+library(plyr)
+library(h2o)              # ml by H2O
+library(rstudioapi)       # needed for h2o
+library(rmdformats)
+
+```
+
+# Task Overview
+  
+Our goal is to predict indoor location by training machine learning algorithms on wifi fingerprints. 
+We used theopen source  UJIndoorLoc datsets that contains Wireless Access Points (WAPs) and the corresponding Received Signal Strength Intensity (RSSI).
+ for 3 buildings of the  Universitat Jaume I.  
+![Universitat Jaume I](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/University.PNG)
+
+ 
+# The structure of the presentation is a s follows:
+
+1. __Data description and preprocessing__  
+1. __Exploratory Data Analysis__
+1. __Machine Learning models and Strategy followed__
+1. __Predictions Tuning , Metrics and Final results__
+1. __Final results__
+
+# Data description and preprocessing 
+
+- Data contains 520 different WAPs that were used for training (after preprocess) and 9 more variables as they appear below:
+- Longitude
+- Latitude
+- Floor (0-4)
+- BuildingID (1-3)
+- SpaceID (office, corridor, classroom)
+- RelativePosition (1 - Inside, 2 - Outside in Front of the door)
+- UserID
+- PhoneID
+- Timestamp
+
+```{r importing, include=FALSE}
+TrainSet<-read.csv("C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/UJIndoorLoc/trainingData.csv")
+ValidSet<-read.csv("C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/UJIndoorLoc/validationData.csv")
+
+#Create total dataset
+TotalData<-rbind(TrainSet,ValidSet)
+TotalData<-as.data.frame(TotalData) # Dataframe
+
+# create a tidy Total data
+Tidy_TotalData<-TotalData%>% 
+  gather(key="WAP" ,value="RSSI",WAP001:WAP520, factor_key=TRUE)
+```  
+
+```{r ggpairs, echo=FALSE}
+ggpairs(TotalData[,521:529])
+```
+
+1. We __combined the training and validation dataset__ and create 2 new stratified datsets(based on building and floor)
+    - A training set  58% 
+    - A validation set 42%
+1. We __replaced__ rssi values of __100__ and those __less than -85 with -100__
+   There were discovered 10.378.985 bad signals(or non registered).
+1. we __removed rows and columns__ containing __duplicate__ values 
+
+## Further preprocessing issues
+
+1. __Multicollinearity:__ We run a a collinearity check (looking for high valued eigenvectors and eigenvalues near zero) but we did not proceed in removing the issue as the algorithms we use for prediction and clasification are nonlinear and ruled based(most of them pick variables with heighst variance and by default exclude almost constant variables.
+1. __Normalization and Standarization:__ The only algorythm that required normalization was the deep neuaral network but H2o takes care of that for us.
+
+# Exploratory Data Analysis
+
+
+## 3D PLot of location of original Data
+
+```{r label, echo=FALSE}
+# plot new datasets
+plot_ly(x=TotalData$LONGITUDE, y=TotalData$LATITUDE, z=TotalData$FLOOR, type="scatter3d", mode="markers", color=TotalData$FLOOR,size = I(20))%>%
+  layout(title = 'location points by floor')
+
+plot_ly(x=TotalData$LONGITUDE, y=TotalData$LATITUDE, z=TotalData$FLOOR, type="scatter3d", mode="markers", color=TotalData$USERID,size = I(20))%>%
+  layout(title = 'location points by user')
+
+```
+
+
+```{r replace-with-NA, include=FALSE}
+# Remove duplicate rows in a data frame
+
+TotalData<- distinct(TotalData)
+
+# Replace weak signal and NAs
+TotalData[, 1:520][TotalData[, 1:520] == 100] <- NA # replacing the unrecorded
+TotalData[, 1:520][TotalData[, 1:520] < -85]<- NA  # replacing the bad signal 
+
+```
+
+```{r wap counter, include=FALSE}
+# count in new column the number of waps that have readings(not NAs)
+TotalData$WAP_num <- apply(TotalData[,1:520], 1,
+                           function(x) length(which(!is.na(x))))
+
+# count in new colun the number of Waps with RSSI<-60
+TotalData$Good_Signal <- apply(TotalData[,1:520], 1,
+                               function(x) length(which(x>-60)))
+```
+
+```{r Remove-duplicates, include=FALSE}
+#-Remove columns with all NA values
+TotalData <- TotalData[,colSums(is.na(TotalData))<nrow(TotalData)]
+# colSums(is.na(TotalData):  Get the vector of NAs and find how many there are per column 
+# Then retain the columns If the sum is less than the length of the rows, else they have all NAs   
+
+#-Remove rows with all NA values
+TotalData <- TotalData[rowSums(is.na(TotalData[,1:435])) != ncol(TotalData[,1:435]),]
+# rowSums(is.na(TotalData[,1:460])): Get the vector of NAs that are not equal to number of columns 
+
+```
+
+
+```{r datatypes process, include=FALSE}
+#-Change data types
+TotalData[,1:426]<-lapply(TotalData[,1:426],as.numeric)
+TotalData$TIMESTAMP <-as.POSIXlt(TotalData$TIMESTAMP,tz = "UTC", origin = "1970/01/01 00:00:00","%Y/%m/%d %H:%M:%S")
+TotalData[,427:433]<-lapply(TotalData[,427:432],as.factor)
+
+#-rename levels for BUILDINGID and floor
+TotalData$BUILDINGID <- factor(TotalData$BUILDINGID, labels = c("Building 1", 
+                                                                "Building 2", 
+                                                                "Building 3"))
+
+TotalData$FLOOR <- factor(TotalData$FLOOR, labels = c("floor 0", 
+                                                      "floor 1", 
+                                                      "floor 2",
+                                                      "floor 3",
+                                                      "floor 4"))
+
+# Drop TIMESTAMP
+TotalData<-TotalData[,-433]
+sum(is.na(TotalData))# 8.419.529 from 10.378.98
+
+#Have an NA dataset to use for graphs(in order not to mess histgrams)
+TotalData.NA<-TotalData 
+```
+
+
+```{r create-newdatasets, include=FALSE}
+#replace NA with -100 in the TotalDataset
+TotalData[is.na(TotalData)] <- -100
+#-create column to stratify against 
+
+TotalData$Strata<-paste(TotalData$BUILDINGID, "-", TotalData$FLOOR)
+
+# considering response variable as strata
+set.seed(107) # better try another partition trying new seed
+# the randomness in our split perhaps matters more than the randomness in our model
+
+data_part <- caret::createDataPartition(y = TotalData$Strata, 
+                                        p = 0.7, list = F)
+valid <- TotalData[-data_part,] # 30% #we will have class imbalance building 3 
+train <- TotalData[data_part,] # 70% 
+
+```
+# Machine Learning models and Strategy followed
+
+```{r h2o Building, include=FALSE}
+
+set.seed(1234)
+
+pacman::p_load(readr,h2o, rstudioapi, caret)
+# Initialize  h2o cluster
+h2o.init()
+
+# Convert data to h2o frame
+train.h2o <- as.h2o(train) 
+test.h2o <- as.h2o(valid)
+
+# Identify target and features
+
+#dependent variable (BUILDINGID)
+y.dep <- 428 #BUILDING ID
+
+#independent variables (WAPS)
+x.indep <- c(1:424) #WAPS
+```
+## - __STEP 1__: Predicting Building with rule based clasifiers
+
+We used the wap features to predict building and split accordingly the validation dataset by building replacing the Building-Id with our prediction. 
+__For the prediction we trained 2 types of models: GBM ,DRF and choose the most accurate.__
+
+For Random Forest and Gradient Boosted Machine we used Random Grid search to Tune the hyperparameters:
+
+__1) 20 DRF models tuning for (number of trees,min rows,mtries,depth)__
+
+```{r RF-Building, eval=FALSE, include=FALSE}
+#Random forest grid 
+  system.time(
+  grid.RF <- h2o.grid("randomForest", grid_id = "RF_2",
+               search_criteria = list(
+                 strategy = "RandomDiscrete",
+                 max_models = 20 
+               ),
+               hyper_params = list(
+                 min_rows = c(10,20,5),
+                 mtries = c(100, 50, 25),
+                 col_sample_rate_per_tree = c(0.75, 0.9, 1.0),
+                 sample_rate = c(0.5, 0.7, 0.9),
+                 max_depth = c(40, 60, 120),
+                 ntrees = c(400,1000,250)
+               ),
+               x = x.indep, y = y.dep, training_frame = train.h2o,
+               validation_frame = test.h2o,
+               stopping_tolerance = 0.0001,
+               stopping_rounds = 4,
+               score_tree_interval = 3
+  )
+)
+grid.RF
+
+
+```
+
+![5 Best Models Random Forest](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/BuildingRF-Models.PNG)
+
+```{undefined eval=FALSE, include=FALSE}
+LeadBY.Build_03
+```
+
+
+__2) 20 GBM models with 500 trees tuning mainly(max depth, min rows, sample rate)__
+
+![5 Best Models Gradient Boosted Machine](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/BuildingGBM-Models.PNG)
+
+We choose the best GBM model to predict building( _being the best performer_ )
+
+![Confusion Matrix of choosen GBM clasifier](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/Building_ConfMatrix.PNG)
+ 
+__Building 3 appears to be the most difficult to predict.__ 
+  
+## - __STEP 2__: Predicting Floor in each Building with stacked models
+
+We used the validation set as our new training set spliting it by building. First Ensambles and specificly stacking was used to predict the floor in each of the 3 datasets.
+__The Ensample stracture comprises of a  combination of 2 non linear models stacked with a linear one.__
+After that we trained 40 different models using H2O AutoML model builder and choose the top performer ( _It outperformed the ensembles by a long magrin_ )
+
+### Predicting Floor in Building 1
+
+For clasification the criterio of choice is the mean per class error
+
+![Top 5 Models for Building 1](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/FloorB1Models.PNG)
+
+We choose the random forest as suggested by AutoML leaderboard.
+
+![Random Forest for Floor Prediction in Building 1](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/FloorB1BestModel.PNG)
+
+![Confusion Matrix Building 1](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/Floor_B1_CM.PNG)
+
+
+### Predicting Floor in Building 2
+
+![Top 5 Models for Building 2](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/FloorB2Models.PNG)
+
+We choose the neural network as suggested by AutoML leaderboard.
+
+![Neural Network for Floor Prediction in Building](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/FloorB2BestModel.PNG)
+
+![Confusion Matrix Building 2](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/Floor_B2_CM.PNG)
+
+### Predicting Floor in Building 3
+
+![Top 5 Models for Building 3](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/FloorB3Models.PNG)
+
+We choose the random forest as suggested by AutoML leaderboard.
+
+![Random Forest for Floor Prediction in Building 3](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/FloorB3Models.PNG)
+
+![Confusion Matrix Building 3](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/Floor_B3_CM.PNG)
+
+## - __STEP 3__: Predicting Longititude and Latitude 
+
+We used AutoML to choose the appropriate model with automatic hyparemetre tuning to predict the longtitude and latitude.
+
+### Longititude
+
+For regression the criterion of choice is mean residual deviance  
+__Predicting Longititude in Building 1__  
+![Top 5 Models for Building 1](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LongB1Models.PNG)
+
+We choose the stacked enemble as suggested by AutoML leaderboard.
+
+__Predicting Longititude in Building 2__  
+![Top 5 Models for Building 2](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LongB2Models.PNG)
+
+We choose the stacked enemble as suggested by AutoML leaderboard.  
+
+__Predicting Longititude in Building 3__  
+![Top 5 Models for Building 3](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LongB3Models.PNG)
+
+We choose the stacked enemble as suggested by AutoML leaderboard.  
+We were more succesful in predicting Longtitude in Building 1( _as suggested by RMSE and MSE_ ) and the worst prediction is for Building 2. 
+
+### Latitude
+
+__Predicting Latitude in Building 1__  
+![Top 5 Models for Building 1](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LatB1Models.PNG)
+
+__Predicting Latitude in Building 2__  
+![Top 5 Models for Building 2](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LatB2Models.PNG)
+
+__Predicting Latitude in Building 3__  
+![Top 5 Models for Building 3](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LatB3Models.PNG)
+
+Again Building 1 is the best prediction and Building 2 the worst
+
+# __Final results__
+
+### Performance of models used :  
+
+![Clasification metrics](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/Results_1.PNG)
+
+![Regression metrics](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/Result_2.PNG)
+
+
+### Latitude: Predicted VS Real values  
+ 
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/ScaterB1_a.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/ScaterB2_a.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/ScaterB3_a.PNG)
+
+### Longtitude: Predicted VS Real Values 
+
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/ScaterB1_b.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/ScaterB2_b.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/ScaterB3_b.PNG)
+
+- Trying to fit a line through this scatterplot we see that outliers do not influence a lot the outcome and we get a good approximation of a 45 degree line( _that indicates a perfect prediction_ ).  
+- The predictions are better for longtitude and overal for Building 1.   
+- We also discovered a problematic behavoir in our prediction of Latitude in Building 3. 
+
+### Latitude: Error Distribution
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LatitudeErrors_1.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LatitudeErrors_2.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LatitudeErrors_3.PNG)
+
+### Longtitude: Error Distribution
+
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LongtitudeErrors_1.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LongtitudeErrors_2.PNG)
+![](C:/Users/Constantinos/Desktop/Ubiqum/IOT/WIFI/Wifi_Initial_exploration/LongtitudeErrors_3.PNG)
+
+- Longtitude and Latitude Error distribution is centered at 0 and has kirtosis higher than 3 and skewness nearly 0 in most cases
+- We can say it approximates a highpeaked student distribution.
+
+```{r cvc, eval=FALSE, include=FALSE}
+DT::datatable(Results_Reg)
+
+DT::datatable(Results_clf)
+```
